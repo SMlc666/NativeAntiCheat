@@ -21,7 +21,7 @@ bool NativeAntiCheat::enable() {
     return true;
 }
 
-bool MyMNativeAntiCheatod::disable() {
+bool NativeAntiCheatod::disable() {
     getSelf().getLogger().debug("Disabling...");
     // Code for disabling the mod goes here.
     return true;
