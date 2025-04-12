@@ -2,31 +2,31 @@
 
 #include "ll/api/mod/RegisterHelper.h"
 
-namespace my_mod {
+namespace native_ac {
 
-MyMod& MyMod::getInstance() {
+NativeAntiCheat& NativeAntiCheat::getInstance() {
     static MyMod instance;
     return instance;
 }
 
-bool MyMod::load() {
+bool NativeAntiCheat::load() {
     getSelf().getLogger().debug("Loading...");
     // Code for loading the mod goes here.
     return true;
 }
 
-bool MyMod::enable() {
+bool NativeAntiCheat::enable() {
     getSelf().getLogger().debug("Enabling...");
     // Code for enabling the mod goes here.
     return true;
 }
 
-bool MyMod::disable() {
+bool MyMNativeAntiCheatod::disable() {
     getSelf().getLogger().debug("Disabling...");
     // Code for disabling the mod goes here.
     return true;
 }
 
-} // namespace my_mod
+} // namespace native_ac
 
-LL_REGISTER_MOD(my_mod::MyMod, my_mod::MyMod::getInstance());
+LL_REGISTER_MOD(native_ac::NativeAntiCheat, native_ac::NativeAntiCheat::getInstance());
