@@ -27,6 +27,7 @@ public:
     // bool unload();
 
 private:
+    std::string         mConfigPath;
     ll::mod::NativeMod& mSelf;
 };
 

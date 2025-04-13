@@ -1,16 +1,36 @@
 #pragma once
+#include <nlohmann/json.hpp>
 #include <string>
+
 namespace native_ac {
 class Module {
-private:
+private: // variables
     std::string mName;
 
-public:
-    std::string  getName();
+protected:
+    bool mIsLoaded  = false;
+    bool mIsEnabled = false;
+    bool mShouldEnable;
+
+protected: // vFunctions private:
     virtual bool load()    = 0;
     virtual bool enable()  = 0;
     virtual bool disable() = 0;
-    Module(std::string name) : mName(name) {}
+    virtual void from_json(const nlohmann::json& /*j*/) {};
+    virtual void to_json(nlohmann::json& /*j*/) const {};
+
+public:
+    Module(std::string name, bool default_enabled = true) : mName(name), mShouldEnable(default_enabled) {}
+    std::string getName();
+    bool        loadE();                             // loadExport
+    bool        enableE();                           // enableExport
+    bool        disableE();                          // disableExport
+    void        from_jsonE(const nlohmann::json& j); // from_jsonExport
+    void        to_jsonE(nlohmann::json& j) const;   // to_jsonExport
+    bool        isEnaled() const { return mIsEnabled; }
+    bool        shouldEnable() const { return mShouldEnable; }
+
+public: // virtual functions
     virtual ~Module() {}
 };
 } // namespace native_ac
