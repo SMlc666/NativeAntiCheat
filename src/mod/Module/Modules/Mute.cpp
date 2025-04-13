@@ -91,6 +91,11 @@ bool MuteModule::enable() {
                     || event.commandContext().mCommand.find("w") != std::string::npos
                     || event.commandContext().mCommand.find("me") != std::string::npos) {
                     if (isMuted(player->getRealName())) {
+                        player->sendMessage(fmt::format(
+                            "You are muted. Reason: {}",
+                            MuteList[player->getRealName()].reason.empty() ? "Not specified"
+                                                                           : MuteList[player->getRealName()].reason
+                        ));
                         event.cancel();
                     }
                 }
@@ -101,6 +106,11 @@ bool MuteModule::enable() {
         [this](ll::event::PlayerChatEvent& event) {
             std::lock_guard<std::mutex> lock(muteListMutex);
             if (isMuted(event.self().getRealName())) {
+                event.self().sendMessage(fmt::format(
+                    "You are muted. Reason: {}",
+                    MuteList[event.self().getRealName()].reason.empty() ? "Not specified"
+                                                                        : MuteList[event.self().getRealName()].reason
+                ));
                 event.cancel();
             }
         }
