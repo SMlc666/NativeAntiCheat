@@ -1,7 +1,6 @@
 #include "ModuleManager.hpp"
 #include "mod/NativeAntiCheat.h"
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -32,7 +31,7 @@ ModuleManager& ModuleManager::getInstance() {
 Module* ModuleManager::getModuleByName(std::string_view moduleName) {
     auto it = mModuleList.find(std::string(moduleName));
     if (it != mModuleList.end()) {
-        return it->second.get();
+        return it->second; // Now stores Module* directly
     }
 #ifdef DEBUG
     NativeAntiCheat::getInstance().getSelf().getLogger().warn("Module not found: {}", moduleName);
@@ -40,7 +39,7 @@ Module* ModuleManager::getModuleByName(std::string_view moduleName) {
     return nullptr;
 }
 
-bool ModuleManager::addModule(std::string_view name, std::unique_ptr<Module> module) {
+bool ModuleManager::addModule(std::string_view name, Module* module) {
     if (!module) {
 #ifdef DEBUG
         NativeAntiCheat::getInstance().getSelf().getLogger().error(
@@ -50,7 +49,7 @@ bool ModuleManager::addModule(std::string_view name, std::unique_ptr<Module> mod
 #endif
         return false;
     }
-    auto result = mModuleList.try_emplace(std::string(name), std::move(module));
+    auto result = mModuleList.try_emplace(std::string(name), module); // Store raw pointer, no move needed
     if (!result.second) {
 #ifdef DEBUG
         NativeAntiCheat::getInstance().getSelf().getLogger().warn("Module {} already exists, not adding again.", name);
@@ -60,7 +59,7 @@ bool ModuleManager::addModule(std::string_view name, std::unique_ptr<Module> mod
     return true;
 }
 
-bool ModuleManager::addModule(std::unique_ptr<Module> module) {
+bool ModuleManager::addModule(Module* module) {
     if (!module) {
 #ifdef DEBUG
         NativeAntiCheat::getInstance().getSelf().getLogger().error("Attempted to add a null module.");
@@ -69,12 +68,12 @@ bool ModuleManager::addModule(std::unique_ptr<Module> module) {
     }
     // 获取模块名称前检查 module 是否有效 (已在 addModule(name, module) 中处理)
     std::string moduleNameStr = module->getName();
-    return addModule(moduleNameStr, std::move(module));
+    return addModule(moduleNameStr, module); // Pass raw pointer, no move needed
 }
 
 void ModuleManager::forEachModule(std::function<bool(Module*)> callback) {
     for (auto& [name, module] : mModuleList) {
-        if (module && !callback(module.get())) {
+        if (module && !callback(module)) { // module is now Module*
             break;
         }
     }
@@ -92,7 +91,7 @@ void ModuleManager::registerModulesFromRegistry() {
         if (factory) {
             auto module = factory();
             if (module) {
-                addModule(std::move(module));
+                addModule(module); // module is now Module*, no move needed
             } else {
 #ifdef DEBUG
                 NativeAntiCheat::getInstance().getSelf().getLogger().error(

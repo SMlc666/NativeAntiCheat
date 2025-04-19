@@ -15,7 +15,10 @@
 #include "mc/world/level/Level.h"
 #include "mod/Module/Module.hpp"
 #include "mod/Module/ModuleManager.hpp" // Needed for REGISTER_MODULE
+#include "mod/NativeAntiCheat.h"
+#include <iomanip> // Required for std::put_time, std::get_time
 #include <nlohmann/json.hpp>
+#include <sstream> // Required for std::ostringstream, std::istringstream
 #include <thread>
 #include <vector> // For collecting names to remove
 
@@ -29,6 +32,11 @@ struct MuteCommand {
 struct UnMuteCommand {
     CommandSelector<Player> mPlayer;
 };
+MuteModule* MuteModule::getInstance() {
+    static MuteModule instance;
+    return &instance;
+}
+
 MuteModule::MuteModule() : Module("Mute") {}
 bool MuteModule::isMuted(const std::string& name) {
     auto it = MuteList.find(name);
@@ -134,7 +142,7 @@ bool MuteModule::enable() {
             for (auto const& player : param.mPlayer.results(origin)) {
                 auto now                        = std::chrono::system_clock::now();
                 auto expirationTime             = now + std::chrono::seconds(param.mMuteSeconds);
-                MuteList[player->getRealName()] = {expirationTime, param.mMuteSeconds, param.mReason};
+                MuteList[player->getRealName()] = {expirationTime, param.mReason}; // Removed duration_seconds
 #ifdef DEBUG
                 output.success(
                     "{} has been muted for {} seconds until {}",
@@ -186,47 +194,97 @@ bool MuteModule::disable() {
 void MuteModule::to_json(nlohmann::json& j) const {
     std::lock_guard<std::mutex> lock(muteListMutex);
     nlohmann::json              muteListData = nlohmann::json::object();
+    const char*                 fmt          = "%Y-%m-%d %H:%M:%S"; // 定义格式化字符串
+
     for (const auto& [name, info] : MuteList) {
-        // Only save mutes that haven't expired yet
+        // 只保存尚未过期的禁言记录
         if (info.expiration_time > std::chrono::system_clock::now()) {
             nlohmann::json muteInfoJson;
-            muteInfoJson["expiration_timestamp_ms"] =
-                std::chrono::duration_cast<std::chrono::milliseconds>(info.expiration_time.time_since_epoch()).count();
-            muteInfoJson["duration_seconds"] = info.duration_seconds;
+
+            // 将 time_point 转换为 time_t，然后转换为 tm (本地时间)
+            std::time_t expiration_tt = std::chrono::system_clock::to_time_t(info.expiration_time); // 获取 time_t
+            std::tm     expiration_tm; // 声明 tm 结构体变量
+            localtime_s(&expiration_tm, &expiration_tt); // 使用 localtime_s
+
+            // 将时间格式化为字符串
+            std::ostringstream oss;
+            oss << std::put_time(&expiration_tm, fmt);
+            muteInfoJson["expiration_time_str"] = oss.str(); // 存储格式化后的时间字符串
+            // Removed serialization of duration_seconds
             muteInfoJson["reason"]           = info.reason;
             muteListData[name]               = muteInfoJson;
         }
     }
-    j["MuteList"] = muteListData; // Store under a key for clarity
+    j["MuteList"] = muteListData; // 将禁言列表数据存储在 "MuteList" 键下，以提高清晰度
 }
 
 void MuteModule::from_json(const nlohmann::json& j) {
     if (!j.contains("MuteList") || !j["MuteList"].is_object()) {
-        // Log error or handle missing/invalid data
+        // 记录错误或处理丢失/无效的数据
+        // 可以在此处添加日志记录: logger.warn("JSON 数据中缺少 MuteList 或格式无效。");
+        NativeAntiCheat::getInstance().getSelf().getLogger().error("JSON data missing MuteList or invalid format.");
         return;
     }
     std::lock_guard<std::mutex> lock(muteListMutex);
-    MuteList.clear(); // Clear existing data before loading
+    MuteList.clear(); // 加载前清除现有数据
     const auto& muteListData = j["MuteList"];
     auto        now          = std::chrono::system_clock::now();
+    const char* fmt          = "%Y-%m-%d %H:%M:%S"; // 定义格式化字符串
+
     for (auto it = muteListData.begin(); it != muteListData.end(); ++it) {
         const std::string& name         = it.key();
         const auto&        muteInfoJson = it.value();
-        if (!muteInfoJson.is_object() || !muteInfoJson.contains("expiration_timestamp_ms")
-            || !muteInfoJson.contains("duration_seconds") || !muteInfoJson.contains("reason")) {
-            // Log error for invalid entry format
+
+        // 检查是否为新的字符串格式以及是否包含必要的字段
+        // Check if it's the new format (without duration_seconds)
+        if (muteInfoJson.is_object() && muteInfoJson.contains("expiration_time_str") && muteInfoJson.contains("reason") && !muteInfoJson.contains("duration_seconds")) {
+            std::string expirationStr = muteInfoJson["expiration_time_str"].get<std::string>();
+            // int         durationSecs  = muteInfoJson["duration_seconds"].get<int>(); // Removed
+            std::string reason        = muteInfoJson["reason"].get<std::string>();
+
+            std::tm            expiration_tm = {};
+            std::istringstream iss(expirationStr);
+            iss >> std::get_time(&expiration_tm, fmt); // 解析字符串
+
+            if (iss.fail()) {
+                // 记录时间格式无效的错误
+                // 可以在此处添加日志记录: logger.error("解析用户 {} 的过期时间字符串 '{}' 失败", name, expirationStr);
+                NativeAntiCheat::getInstance().getSelf().getLogger().error(
+                    "Failed to parse expiration time string for user {}: {}",
+                    name,
+                    expirationStr
+                );
+                continue;
+            }
+
+            // 将 tm 转换回 time_t，然后转换为 time_point
+            std::time_t expiration_tt = std::mktime(&expiration_tm);
+            if (expiration_tt == -1) {
+                // 记录时间转换无效的错误
+                // 可以在此处添加日志记录: logger.error("将用户 {} 解析后的时间转换为 time_t 失败", name);
+                NativeAntiCheat::getInstance().getSelf().getLogger().error(
+                    "Failed to convert parsed expiration time for user {} to time_t",
+                    name
+                );
+                continue;
+            }
+            auto expirationTime = std::chrono::system_clock::from_time_t(expiration_tt);
+
+            // 只加载尚未过期的禁言记录
+            if (expirationTime > now) {
+                MuteList[name] = {expirationTime, reason}; // Removed durationSecs
+            }
+        } else {
+            // 记录条目格式无效或缺少必要字段的错误
+            // Removed handling for old format with duration_seconds
+            NativeAntiCheat::getInstance().getSelf().getLogger().warn(
+                "Skipping invalid or incomplete mute entry for key '{}' (expected format without duration_seconds)",
+                name
+            );
             continue;
-        }
-        long long   expirationMs   = muteInfoJson["expiration_timestamp_ms"].get<long long>();
-        int         durationSecs   = muteInfoJson["duration_seconds"].get<int>();
-        std::string reason         = muteInfoJson["reason"].get<std::string>();
-        auto        expirationTime = std::chrono::system_clock::time_point(std::chrono::milliseconds(expirationMs));
-        // Only load mutes that haven't expired yet
-        if (expirationTime > now) {
-            MuteList[name] = {expirationTime, durationSecs, reason};
         }
     }
 }
 
 } // namespace native_ac
-REGISTER_MODULE(native_ac::MuteModule);
+REGISTER_MODULE(native_ac::MuteModule, native_ac::MuteModule::getInstance());

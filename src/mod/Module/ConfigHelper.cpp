@@ -19,7 +19,11 @@ std::optional<std::string> ConfigHelper::LoadConfig(const std::string& config_fi
     try {
         module_manager.forEachModule([&](Module* module) {
             try {
-                module->from_jsonE(config_json[module->getName()]);
+                if (config_json.contains(module->getName())) {
+                    module->from_jsonE(config_json[module->getName()]);
+                } else {
+                    throw std::runtime_error(fmt::format("Missing config section for module {}", module->getName()));
+                }
             } catch (const nlohmann::json::exception& e) {
                 throw fmt::format(
                     "Failed to parse config for module: {}. Error message: {}",

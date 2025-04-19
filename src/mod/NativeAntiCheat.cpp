@@ -43,12 +43,18 @@ bool NativeAntiCheat::load() {
             return false;
         }
     }
+#ifdef DEBUG
+    getSelf().getLogger().debug("Starting Loading config file: {}", mConfigPath);
+#endif
     std::optional<std::string> config_result =
         ConfigHelper::LoadConfig(mConfigPath, native_ac::ModuleManager::getInstance());
     if (config_result.has_value()) {
         getSelf().getLogger().error("Failed to load config: {}", config_result.value());
         return false;
     }
+#ifdef DEBUG
+    getSelf().getLogger().debug("Starting to load modules...");
+#endif
     ModuleManager::getInstance().forEachModule([this](Module* module) {
 #ifdef DEBUG
         BenchMark loadModuleBench([this, &module](Timer& time) {

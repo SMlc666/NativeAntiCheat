@@ -11,12 +11,11 @@
 
 namespace native_ac {
 
-class MuteModule : public Module {
+class MuteModule final : public Module {
 public:
     struct MuteInfo {
-        std::chrono::system_clock::time_point expiration_time;  // 禁言到期时间点
-        int                                   duration_seconds; // 禁言持续秒数
-        std::string                           reason;           // 禁言原因
+        std::chrono::system_clock::time_point expiration_time; // 禁言到期时间点
+        std::string                           reason;          // 禁言原因
     };
 
 private:
@@ -28,7 +27,8 @@ private:
     mutable std::mutex muteListMutex; // Marked mutable to allow locking in const methods like to_json
 
 public:
-    bool isMuted(const std::string& name);
+    static MuteModule* getInstance(); // Add static getInstance method
+    bool               isMuted(const std::string& name);
     MuteModule();
     bool load() override;
     bool enable() override;
