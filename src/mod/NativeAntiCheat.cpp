@@ -24,18 +24,10 @@ bool NativeAntiCheat::load() {
     getSelf().getLogger().debug("mConfigPath: {}", mConfigPath);
 #endif
     native_ac::ModuleManager::getInstance().registerModulesFromRegistry();
+    // 确保配置目录存在
+    std::filesystem::create_directories(std::filesystem::path(mConfigPath).parent_path());
     if (!std::filesystem::exists(mConfigPath)) {
         getSelf().getLogger().info("no config file found, using default config");
-#ifdef DEBUG
-        getSelf().getLogger().debug(
-            "Creating config directory if not exists: {}",
-            std::filesystem::path(mConfigPath).parent_path().string()
-        );
-#endif
-        std::filesystem::create_directories(std::filesystem::path(mConfigPath).parent_path()); // 确保目录存在
-#ifdef DEBUG
-        getSelf().getLogger().debug("Config directory created or already exists.");
-#endif
         std::optional<std::string> config_result =
             ConfigHelper::SaveConfig(mConfigPath, native_ac::ModuleManager::getInstance());
         if (config_result.has_value()) {
@@ -109,7 +101,7 @@ bool NativeAntiCheat::disable() {
     });
 #endif
     ModuleManager::getInstance().forEachModule([this](Module* module) {
-        if (module->isEnaled()) {
+        if (module->isEnabled()) {
 #ifdef DEBUG
             NativeAntiCheat::getInstance().getSelf().getLogger().debug("Disabling module: {}", module->getName());
             BenchMark bench_mark([&module](Timer& timer) {

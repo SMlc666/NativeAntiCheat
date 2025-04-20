@@ -2,6 +2,7 @@
 #include "ll/api/event/Listener.h"
 #include "ll/api/event/command/ExecuteCommandEvent.h"
 #include "ll/api/event/player/PlayerChatEvent.h"
+#include "ll/api/event/world/LevelTickEvent.h"
 #include "mod/Module/Module.hpp"
 #include "parallel_hashmap/phmap.h"
 #include <chrono>
@@ -21,10 +22,11 @@ public:
 private:
     std::shared_ptr<ll::event::Listener<ll::event::ExecutingCommandEvent>> cmdListener;
     std::shared_ptr<ll::event::Listener<ll::event::PlayerChatEvent>>       chatListener;
+    std::shared_ptr<ll::event::Listener<ll::event::LevelTickEvent>>        tickListener;
     phmap::flat_hash_map<std::string, MuteInfo>                            MuteList;
-    void                                                                   cleanMuteList();
-    bool                                                                   cleanMuteListRunnning = false;
     mutable std::mutex muteListMutex; // Marked mutable to allow locking in const methods like to_json
+    int                ListCommandPageSize = 10;
+    void*              tickHandle          = nullptr;
 
 public:
     static MuteModule* getInstance(); // Add static getInstance method

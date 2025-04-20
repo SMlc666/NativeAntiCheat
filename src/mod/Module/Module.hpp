@@ -27,7 +27,7 @@ public:
     bool        disableE();                          // disableExport
     void        from_jsonE(const nlohmann::json& j); // from_jsonExport
     void        to_jsonE(nlohmann::json& j) const;   // to_jsonExport
-    bool        isEnaled() const { return mIsEnabled; }
+    bool        isEnabled() const { return mIsEnabled; }
     bool        shouldEnable() const { return mShouldEnable; }
 
 public: // virtual functions

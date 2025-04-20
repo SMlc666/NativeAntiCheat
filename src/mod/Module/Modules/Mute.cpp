@@ -3,18 +3,22 @@
 #include "ll/api/command/CommandRegistrar.h"
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/command/ExecuteCommandEvent.h"
+#include "ll/api/event/world/LevelTickEvent.h"
 #include "ll/api/service/Bedrock.h"
 #include "mc/network/NetEventCallback.h"
 #include "mc/network/ServerNetworkHandler.h"
 #include "mc/network/packet/Packet.h"
+#include "mc/server/commands/Command.h"
 #include "mc/server/commands/CommandOutput.h"
 #include "mc/server/commands/CommandPermissionLevel.h"
 #include "mc/server/commands/CommandSelector.h"
 #include "mc/world/actor/ActorType.h"
 #include "mc/world/actor/player/Player.h"
 #include "mc/world/level/Level.h"
+#include "mod/BenchMark/BenchMark.hpp"
 #include "mod/Module/Module.hpp"
 #include "mod/Module/ModuleManager.hpp" // Needed for REGISTER_MODULE
+#include "mod/Module/Modules/TickScheduler.hpp"
 #include "mod/NativeAntiCheat.h"
 #include <iomanip> // Required for std::put_time, std::get_time
 #include <nlohmann/json.hpp>
@@ -32,6 +36,9 @@ struct MuteCommand {
 struct UnMuteCommand {
     CommandSelector<Player> mPlayer;
 };
+struct ListMuteCommand {
+    int mPage = 0;
+};
 MuteModule* MuteModule::getInstance() {
     static MuteModule instance;
     return &instance;
@@ -48,42 +55,6 @@ bool MuteModule::isMuted(const std::string& name) {
 }
 // TODO: Implement MuteModule methods here
 bool MuteModule::load() { return true; }
-void MuteModule::cleanMuteList() {
-    // Note: The loop control with cleanMuteListRunnning might need refinement for instant shutdown.
-    // Consider using a condition variable if more precise control is needed.
-    while (cleanMuteListRunnning) {
-        std::vector<std::string> namesToRemove;
-        auto                     now = std::chrono::system_clock::now();
-
-        // First pass: Collect expired mutes without holding the lock for long
-        {
-            std::lock_guard<std::mutex> lock(muteListMutex);
-            for (const auto& [name, info] : MuteList) {
-                if (info.expiration_time <= now) {
-                    namesToRemove.push_back(name);
-                }
-            }
-        } // Lock released here
-
-        // Second pass: Remove collected names and notify players
-        if (!namesToRemove.empty()) {
-            std::lock_guard<std::mutex> lock(muteListMutex);
-            for (const auto& name : namesToRemove) {
-                if (MuteList.erase(name)) { // Check if erase was successful (element existed)
-                    Player* player = ll::service::getLevel()->getPlayer(name);
-                    if (player) {
-                        player->sendMessage("You are no longer muted");
-                    }
-                }
-            }
-        }
-
-        // Sleep only if the loop should continue
-        if (cleanMuteListRunnning) {
-            std::this_thread::sleep_for(std::chrono::seconds(5)); // Check every 5 seconds
-        }
-    }
-}
 bool MuteModule::enable() {
     auto& mutecmd = ll::command::CommandRegistrar::getInstance()
                         .getOrCreateCommand("mute", "Mute player", CommandPermissionLevel::GameDirectors);
@@ -123,9 +94,38 @@ bool MuteModule::enable() {
             }
         }
     );
-    cleanMuteListRunnning = true;
-    std::thread([this] { cleanMuteList(); }).detach();
+    tickHandle = TickSchedulerModule::getInstance()->emplaceTickCallback(
+        [this]() {
+            std::vector<std::string> namesToRemove;
+            auto                     now = std::chrono::system_clock::now();
+
+            // First pass: Collect expired mutes without holding the lock for long
+            {
+                std::lock_guard<std::mutex> lock(muteListMutex);
+                for (const auto& [name, info] : MuteList) {
+                    if (info.expiration_time <= now) {
+                        namesToRemove.push_back(name);
+                    }
+                }
+            } // Lock released here
+
+            // Second pass: Remove collected names and notify players
+            if (!namesToRemove.empty()) {
+                std::lock_guard<std::mutex> lock(muteListMutex);
+                for (const auto& name : namesToRemove) {
+                    if (MuteList.erase(name)) { // Check if erase was successful (element existed)
+                        Player* player = ll::service::getLevel()->getPlayer(name);
+                        if (player) {
+                            player->sendMessage("You are no longer muted");
+                        }
+                    }
+                }
+            }
+        },
+        100
+    );
     mutecmd.overload<MuteCommand>()
+        .text("add")
         .required("mPlayer")
         .required("mMuteSeconds")
         .optional("mReason")
@@ -159,9 +159,69 @@ bool MuteModule::enable() {
                 ));
             }
         });
-    auto& unmutecmd = ll::command::CommandRegistrar::getInstance()
-                          .getOrCreateCommand("unmute", "Unmute player", CommandPermissionLevel::GameDirectors);
-    unmutecmd.overload<UnMuteCommand>().required("mPlayer").execute(
+    mutecmd.overload<ListMuteCommand>().text("list").optional("mPage").execute(
+        [this](CommandOrigin const&, CommandOutput& output, ListMuteCommand const& param, Command const&) {
+            std::lock_guard<std::mutex> lock(muteListMutex);
+            if (MuteList.empty()) {
+                output.error("No active mutes found");
+                return;
+            }
+
+            const size_t pageCount = (MuteList.size() + ListCommandPageSize - 1) / ListCommandPageSize;
+            if (param.mPage < 0 || static_cast<size_t>(param.mPage) >= pageCount) {
+                output.error("Invalid page number (0-" + std::to_string(pageCount - 1) + ")");
+                return;
+            }
+
+            // Calculate page range
+            const auto startIdx = param.mPage * ListCommandPageSize;
+            const auto endIdx   = std::min(startIdx + ListCommandPageSize, static_cast<int>(MuteList.size()));
+
+            // Get current time for remaining duration calculation
+            const auto now = std::chrono::system_clock::now();
+
+            // Header
+            output.success(
+                "Mute List (Page " + std::to_string(param.mPage + 1) + "/" + std::to_string(pageCount) + ")"
+            );
+// Iterate through the page items
+#ifdef DEBUG
+            {
+                BenchMark bench([&output](Timer& timer) {
+                    output.success("Output Mute using time: {}", timer.elapsed());
+                });
+#endif
+                auto it = MuteList.begin();
+                std::advance(it, startIdx);
+                for (int i = startIdx; i < endIdx; ++i, ++it) {
+                    const auto& [name, info] = *it;
+                    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(info.expiration_time - now);
+
+                    std::string timeStr;
+                    if (remaining.count() > 86400) {
+                        timeStr = std::to_string(remaining.count() / 86400) + "d";
+                    } else if (remaining.count() > 3600) {
+                        timeStr = std::to_string(remaining.count() / 3600) + "h";
+                    } else if (remaining.count() > 60) {
+                        timeStr = std::to_string(remaining.count() / 60) + "m";
+                    } else {
+                        timeStr = std::to_string(remaining.count()) + "s";
+                    }
+                    output.success(
+                        "{} - Remaining: {} - Reason: {}",
+                        name,
+                        timeStr,
+                        info.reason.empty() ? "Not specified" : info.reason
+                    );
+                }
+
+#ifdef DEBUG
+            }
+            output.success("Total mutes: {} ", MuteList.size());
+#endif
+        }
+    );
+    mutecmd.overload<UnMuteCommand>().text("remove").required("mPlayer").execute(
         [this](CommandOrigin const& origin, CommandOutput& output, UnMuteCommand const& param, Command const&) {
             std::lock_guard<std::mutex> lock(muteListMutex);
             if (!param.mPlayer.results(origin).size()) {
@@ -170,9 +230,7 @@ bool MuteModule::enable() {
             }
             for (auto const& player : param.mPlayer.results(origin)) {
                 if (!MuteList.erase(player->getRealName())) {
-#ifdef DEBUG
-                    output.error("{} is not muted", player->getRealName());
-#endif
+                    output.success("{} is not muted", player->getRealName());
                     player->sendMessage("You are not muted");
                 }
             }
@@ -184,8 +242,7 @@ bool MuteModule::enable() {
 bool MuteModule::disable() {
     ll::event::EventBus::getInstance().removeListener(cmdListener);
     ll::event::EventBus::getInstance().removeListener(chatListener);
-    cleanMuteListRunnning = false; // Signal the cleaning thread to stop
-    // Note: Consider joining the thread here if cleanMuteList isn't detached and needs graceful shutdown.
+    TickSchedulerModule::getInstance()->removeTickCallback(tickHandle);
     return true;
 }
 
@@ -203,7 +260,7 @@ void MuteModule::to_json(nlohmann::json& j) const {
 
             // 将 time_point 转换为 time_t，然后转换为 tm (本地时间)
             std::time_t expiration_tt = std::chrono::system_clock::to_time_t(info.expiration_time); // 获取 time_t
-            std::tm     expiration_tm; // 声明 tm 结构体变量
+            std::tm     expiration_tm;                   // 声明 tm 结构体变量
             localtime_s(&expiration_tm, &expiration_tt); // 使用 localtime_s
 
             // 将时间格式化为字符串
@@ -211,19 +268,29 @@ void MuteModule::to_json(nlohmann::json& j) const {
             oss << std::put_time(&expiration_tm, fmt);
             muteInfoJson["expiration_time_str"] = oss.str(); // 存储格式化后的时间字符串
             // Removed serialization of duration_seconds
-            muteInfoJson["reason"]           = info.reason;
-            muteListData[name]               = muteInfoJson;
+            muteInfoJson["reason"] = info.reason;
+            muteListData[name]     = muteInfoJson;
         }
     }
-    j["MuteList"] = muteListData; // 将禁言列表数据存储在 "MuteList" 键下，以提高清晰度
+    j["MuteList"]            = muteListData;        // 将禁言列表数据存储在 "MuteList" 键下，以提高清晰度
+    j["ListCommandPageSize"] = ListCommandPageSize; // 存储禁言列表分页大小
 }
 
 void MuteModule::from_json(const nlohmann::json& j) {
     if (!j.contains("MuteList") || !j["MuteList"].is_object()) {
-        // 记录错误或处理丢失/无效的数据
-        // 可以在此处添加日志记录: logger.warn("JSON 数据中缺少 MuteList 或格式无效。");
         NativeAntiCheat::getInstance().getSelf().getLogger().error("JSON data missing MuteList or invalid format.");
         return;
+    }
+    if (j.contains("ListCommandPageSize")) {
+        if (j.at("ListCommandPageSize").is_number_integer()) {
+            ListCommandPageSize = j["ListCommandPageSize"].get<int>();
+        } else {
+            NativeAntiCheat::getInstance().getSelf().getLogger().warn(
+                "Invalid ListCommandPageSize value, using default."
+            );
+        }
+    } else {
+        NativeAntiCheat::getInstance().getSelf().getLogger().warn("ListCommandPageSize not found, using default.");
     }
     std::lock_guard<std::mutex> lock(muteListMutex);
     MuteList.clear(); // 加载前清除现有数据
@@ -237,10 +304,11 @@ void MuteModule::from_json(const nlohmann::json& j) {
 
         // 检查是否为新的字符串格式以及是否包含必要的字段
         // Check if it's the new format (without duration_seconds)
-        if (muteInfoJson.is_object() && muteInfoJson.contains("expiration_time_str") && muteInfoJson.contains("reason") && !muteInfoJson.contains("duration_seconds")) {
+        if (muteInfoJson.is_object() && muteInfoJson.contains("expiration_time_str") && muteInfoJson.contains("reason")
+            && !muteInfoJson.contains("duration_seconds")) {
             std::string expirationStr = muteInfoJson["expiration_time_str"].get<std::string>();
             // int         durationSecs  = muteInfoJson["duration_seconds"].get<int>(); // Removed
-            std::string reason        = muteInfoJson["reason"].get<std::string>();
+            std::string reason = muteInfoJson["reason"].get<std::string>();
 
             std::tm            expiration_tm = {};
             std::istringstream iss(expirationStr);
@@ -248,7 +316,8 @@ void MuteModule::from_json(const nlohmann::json& j) {
 
             if (iss.fail()) {
                 // 记录时间格式无效的错误
-                // 可以在此处添加日志记录: logger.error("解析用户 {} 的过期时间字符串 '{}' 失败", name, expirationStr);
+                // 可以在此处添加日志记录: logger.error("解析用户 {} 的过期时间字符串 '{}' 失败", name,
+                // expirationStr);
                 NativeAntiCheat::getInstance().getSelf().getLogger().error(
                     "Failed to parse expiration time string for user {}: {}",
                     name,

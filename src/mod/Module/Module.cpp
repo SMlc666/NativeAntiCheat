@@ -6,7 +6,7 @@ bool        Module::loadE() {
 
     if (mIsLoaded) {
 #ifdef DEBUG
-        NativeAntiCheat::getInstance().getSelf().getLogger().fatal("override load module{}", this->getName());
+        NativeAntiCheat::getInstance().getSelf().getLogger().error("override load module{}", this->getName());
 #endif
         return false;
     }
