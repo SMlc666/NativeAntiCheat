@@ -1,11 +1,9 @@
 #include "Mute.hpp"
+#include "../LevelDBService.hpp" // Include LevelDB Service
 #include "ll/api/command/CommandHandle.h"
 #include "ll/api/command/CommandRegistrar.h"
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/command/ExecuteCommandEvent.h"
-#include "ll/api/event/world/LevelTickEvent.h"
-#include "ll/api/service/Bedrock.h"
-#include "mc/network/NetEventCallback.h"
 #include "mc/network/ServerNetworkHandler.h"
 #include "mc/network/packet/Packet.h"
 #include "mc/server/commands/Command.h"
@@ -18,16 +16,138 @@
 #include "mod/BenchMark/BenchMark.hpp"
 #include "mod/Module/Module.hpp"
 #include "mod/Module/ModuleManager.hpp" // Needed for REGISTER_MODULE
-#include "mod/Module/Modules/TickScheduler.hpp"
+#include "mod/Module/Modules/core/TickScheduler.hpp"
 #include "mod/NativeAntiCheat.h"
-#include <iomanip> // Required for std::put_time, std::get_time
-#include <nlohmann/json.hpp>
-#include <sstream> // Required for std::ostringstream, std::istringstream
-#include <thread>
-#include <vector> // For collecting names to remove
+#include <algorithm>             // For std::transform
+#include <cstring>               // For memcpy
+#include <leveldb/write_batch.h> // Include for WriteBatch
+#include <ll/api/service/Bedrock.h>
+#include <spdlog/spdlog.h> // For logging errors
+
+// Platform-specific includes for byte swapping
+#ifdef _WIN32
+#include <winsock2.h> // Provides htonll, ntohll (ensure linking ws2_32.lib)
+// Define htobe64/be64toh based on Windows functions if not already defined elsewhere
+#ifndef htobe64
+#define htobe64(x) htonll(x)
+#endif
+#ifndef be64toh
+#define be64toh(x) ntohll(x)
+#endif
+#else
+#include <arpa/inet.h> // Provides htobe64, be64toh on POSIX systems
+#endif
 
 
 namespace native_ac {
+
+// --- Anonymous Namespace for Mute LevelDB Helpers ---
+namespace {
+
+// Key Prefixes
+const std::string kMutePrefix   = "m";
+const std::string kNameSubtype  = "n"; // Mute only uses name subtype
+const std::string kExpiryPrefix = "e";
+const char        kSeparator    = ':';
+
+// Normalize identifier (to lower case)
+std::string NormalizeMuteIdentifier(const std::string& id) {
+    std::string lower_id = id;
+    std::transform(lower_id.begin(), lower_id.end(), lower_id.begin(), [](unsigned char c) { return std::tolower(c); });
+    return lower_id;
+}
+
+// Convert time_point to milliseconds timestamp (uint64_t)
+uint64_t MuteTimePointToMillis(const std::chrono::system_clock::time_point& tp) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
+}
+
+// Convert milliseconds timestamp (uint64_t) to time_point
+std::chrono::system_clock::time_point MuteMillisToTimePoint(uint64_t millis) {
+    return std::chrono::system_clock::time_point(std::chrono::milliseconds(millis));
+}
+
+// Convert uint64_t timestamp to 8-byte big-endian binary string
+std::string MuteTimestampToBigEndianBytes(uint64_t timestamp) {
+    uint64_t    timestamp_be = htobe64(timestamp);
+    std::string bytes(sizeof(timestamp_be), '\0');
+    std::memcpy(&bytes[0], &timestamp_be, sizeof(timestamp_be));
+    return bytes;
+}
+
+// Convert 8-byte big-endian binary string back to uint64_t timestamp
+uint64_t MuteBigEndianBytesToTimestamp(const std::string& bytes) {
+    if (bytes.length() != sizeof(uint64_t)) {
+        MuteModule::getInstance()->mLogger->error(
+            "Invalid byte string length for timestamp conversion: {}",
+            bytes.length()
+        );
+        return 0;
+    }
+    uint64_t timestamp_be;
+    std::memcpy(&timestamp_be, bytes.data(), sizeof(timestamp_be));
+    return be64toh(timestamp_be);
+}
+
+// Create primary data key: m:n:<name>
+std::string CreateMutePrimaryKey(const std::string& name) {
+    return kMutePrefix + kSeparator + kNameSubtype + kSeparator + NormalizeMuteIdentifier(name);
+}
+
+// Create expiration index key: e:m:n:<formatted_expiration_time>:<name>
+std::string CreateMuteExpiryKey(const std::string& name, const std::chrono::system_clock::time_point& expiration) {
+    uint64_t    millis     = MuteTimePointToMillis(expiration);
+    std::string time_bytes = MuteTimestampToBigEndianBytes(millis);
+    return kExpiryPrefix + kSeparator + kMutePrefix + kSeparator + kNameSubtype + kSeparator + time_bytes + kSeparator
+         + NormalizeMuteIdentifier(name);
+}
+
+// Internal function to get MuteInfo from DB
+std::optional<MuteModule::MuteInfo> GetMuteInfoFromDBInternal(const std::string& name) {
+    auto& dbService = LevelDBService::GetInstance();
+    if (!dbService.IsInitialized()) {
+        MuteModule::getInstance()->mLogger->error("LevelDBService not initialized during internal Get.");
+        return std::nullopt;
+    }
+
+    std::string     primaryKey = CreateMutePrimaryKey(name);
+    std::string     valueStr;
+    leveldb::Status status = dbService.Get(primaryKey, &valueStr);
+
+    if (status.IsNotFound()) {
+        return std::nullopt; // Not muted
+    }
+    if (!status.ok()) {
+        MuteModule::getInstance()->mLogger->error("Failed to get Mute for '{}' from DB: {}", name, status.ToString());
+        return std::nullopt; // Error occurred
+    }
+
+    try {
+        nlohmann::json       valueJson = nlohmann::json::parse(valueStr);
+        MuteModule::MuteInfo info;
+        info.expiration_time = MuteMillisToTimePoint(valueJson.at("e").get<uint64_t>());
+        info.reason          = valueJson.at("r").get<std::string>();
+        return info;
+    } catch (const nlohmann::json::parse_error& e) {
+        MuteModule::getInstance()
+            ->mLogger->error("Failed to parse JSON for Mute '{}' from DB: {}. Value: {}", name, e.what(), valueStr);
+        return std::nullopt;
+    } catch (const nlohmann::json::type_error& e) {
+        MuteModule::getInstance()
+            ->mLogger->error("JSON type error for Mute '{}' from DB: {}. Value: {}", name, e.what(), valueStr);
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        MuteModule::getInstance()
+            ->mLogger->error("Unexpected error processing JSON for Mute '{}' from DB: {}", name, e.what());
+        return std::nullopt;
+    }
+}
+
+} // anonymous namespace
+// --- End of Mute LevelDB Helpers ---
+
+
+// --- MuteModule Implementation ---
 struct MuteCommand {
     CommandSelector<Player> mPlayer;
     int                     mMuteSeconds{};
@@ -46,16 +166,22 @@ MuteModule* MuteModule::getInstance() {
 
 MuteModule::MuteModule() : Module("Mute") {}
 bool MuteModule::isMuted(const std::string& name) {
-    auto it = MuteList.find(name);
-    if (it == MuteList.end()) {
-        return false;
+    // Query LevelDB directly
+    auto muteInfoOpt = GetMuteFromDB(name);
+    if (muteInfoOpt.has_value()) {
+        // Check if the mute found in DB is expired
+        return muteInfoOpt->expiration_time > std::chrono::system_clock::now();
     }
-    // Check if the expiration time is in the future
-    return it->second.expiration_time > std::chrono::system_clock::now();
+    return false; // Not found in DB
 }
 // TODO: Implement MuteModule methods here
 bool MuteModule::load() { return true; }
 bool MuteModule::enable() {
+    {
+        std::lock_guard<std::mutex> lock(muteListMutex);
+        MuteList.clear();
+    }
+
     auto& mutecmd = ll::command::CommandRegistrar::getInstance()
                         .getOrCreateCommand("mute", "Mute player", CommandPermissionLevel::GameDirectors);
     cmdListener = ll::event::EventBus::getInstance().emplaceListener<ll::event::ExecutingCommandEvent>(
@@ -113,6 +239,16 @@ bool MuteModule::enable() {
             if (!namesToRemove.empty()) {
                 std::lock_guard<std::mutex> lock(muteListMutex);
                 for (const auto& name : namesToRemove) {
+                    // Remove from LevelDB first
+                    leveldb::Status status = RemoveMuteFromDB(name);
+                    if (!status.ok() && !status.IsNotFound()) {
+                        MuteModule::getInstance()->mLogger->warn(
+                            "[MuteModule Tick] Failed to remove expired mute for {} from LevelDB: {}",
+                            name,
+                            status.ToString()
+                        );
+                    }
+                    // Then remove from memory
                     if (MuteList.erase(name)) { // Check if erase was successful (element existed)
                         Player* player = ll::service::getLevel()->getPlayer(name);
                         if (player) {
@@ -140,9 +276,28 @@ bool MuteModule::enable() {
                 return;
             }
             for (auto const& player : param.mPlayer.results(origin)) {
-                auto now                        = std::chrono::system_clock::now();
-                auto expirationTime             = now + std::chrono::seconds(param.mMuteSeconds);
-                MuteList[player->getRealName()] = {expirationTime, param.mReason}; // Removed duration_seconds
+                auto        now            = std::chrono::system_clock::now();
+                auto        expirationTime = now + std::chrono::seconds(param.mMuteSeconds);
+                std::string realName       = player->getRealName();
+                std::string reason         = param.mReason.empty() ? "Not specified" : param.mReason;
+
+                // Update memory cache
+                MuteList[realName] = {expirationTime, reason};
+
+                // Add to LevelDB
+                leveldb::Status status = AddMuteToDB(realName, expirationTime, reason);
+                if (!status.ok()) {
+                    MuteModule::getInstance()->mLogger->error(
+                        "[MuteModule] Failed to add Mute for {} to LevelDB: {}",
+                        realName,
+                        status.ToString()
+                    );
+                    output.error(fmt::format("Failed to save mute for {} to database.", realName));
+                    // Optionally remove from memory cache if DB write fails?
+                    MuteList.erase(realName);
+                    continue; // Skip messaging the player if save failed
+                }
+
 #ifdef DEBUG
                 output.success(
                     "{} has been muted for {} seconds until {}",
@@ -152,11 +307,9 @@ bool MuteModule::enable() {
                     "future time" // Placeholder for formatted time
                 );
 #endif
-                player->sendMessage(fmt::format(
-                    "You have been muted for {} seconds. Reason: {}",
-                    param.mMuteSeconds,
-                    param.mReason.empty() ? "Not specified" : param.mReason
-                ));
+                player->sendMessage(
+                    fmt::format("You have been muted for {} seconds. Reason: {}", param.mMuteSeconds, reason)
+                );
             }
         });
     mutecmd.overload<ListMuteCommand>().text("list").optional("mPage").execute(
@@ -229,9 +382,27 @@ bool MuteModule::enable() {
                 return;
             }
             for (auto const& player : param.mPlayer.results(origin)) {
-                if (!MuteList.erase(player->getRealName())) {
-                    output.success("{} is not muted", player->getRealName());
-                    player->sendMessage("You are not muted");
+                std::string realName = player->getRealName();
+
+                // Remove from LevelDB first
+                leveldb::Status status = RemoveMuteFromDB(realName);
+                if (!status.ok() && !status.IsNotFound()) {
+                    mLogger->error("Failed to remove Mute for {} from LevelDB: {}", realName, status.ToString());
+                    output.error(fmt::format("Failed to remove mute for {} from database.", realName));
+                    // Continue to attempt memory removal? Yes.
+                }
+
+                // Remove from memory cache
+                if (MuteList.erase(realName)) {
+                    output.success(fmt::format("Unmuted {}.", realName));
+                    player->sendMessage("You have been unmuted.");
+                } else {
+                    // If not found in memory, double-check DB wasn't the only place it existed
+                    if (status.ok() || status.IsNotFound()) { // If DB removal succeeded or it wasn't there anyway
+                        output.success(fmt::format("{} was not muted.", realName));
+                        player->sendMessage("You were not muted.");
+                    }
+                    // If DB removal failed, we already sent an error message.
                 }
             }
         }
@@ -249,111 +420,125 @@ bool MuteModule::disable() {
 // --- JSON Serialization ---
 
 void MuteModule::to_json(nlohmann::json& j) const {
-    std::lock_guard<std::mutex> lock(muteListMutex);
-    nlohmann::json              muteListData = nlohmann::json::object();
-    const char*                 fmt          = "%Y-%m-%d %H:%M:%S"; // 定义格式化字符串
-
-    for (const auto& [name, info] : MuteList) {
-        // 只保存尚未过期的禁言记录
-        if (info.expiration_time > std::chrono::system_clock::now()) {
-            nlohmann::json muteInfoJson;
-
-            // 将 time_point 转换为 time_t，然后转换为 tm (本地时间)
-            std::time_t expiration_tt = std::chrono::system_clock::to_time_t(info.expiration_time); // 获取 time_t
-            std::tm     expiration_tm;                   // 声明 tm 结构体变量
-            localtime_s(&expiration_tm, &expiration_tt); // 使用 localtime_s
-
-            // 将时间格式化为字符串
-            std::ostringstream oss;
-            oss << std::put_time(&expiration_tm, fmt);
-            muteInfoJson["expiration_time_str"] = oss.str(); // 存储格式化后的时间字符串
-            // Removed serialization of duration_seconds
-            muteInfoJson["reason"] = info.reason;
-            muteListData[name]     = muteInfoJson;
-        }
-    }
-    j["MuteList"]            = muteListData;        // 将禁言列表数据存储在 "MuteList" 键下，以提高清晰度
-    j["ListCommandPageSize"] = ListCommandPageSize; // 存储禁言列表分页大小
+    // Mute list is now saved to LevelDB, no longer to JSON.
+    // Only save configuration options.
+    j["ListCommandPageSize"] = ListCommandPageSize;
 }
 
 void MuteModule::from_json(const nlohmann::json& j) {
-    if (!j.contains("MuteList") || !j["MuteList"].is_object()) {
-        NativeAntiCheat::getInstance().getSelf().getLogger().error("JSON data missing MuteList or invalid format.");
-        return;
-    }
+    // Mute list is now loaded from LevelDB in enable(), no longer from JSON.
+    // Only load configuration options.
     if (j.contains("ListCommandPageSize")) {
         if (j.at("ListCommandPageSize").is_number_integer()) {
             ListCommandPageSize = j["ListCommandPageSize"].get<int>();
         } else {
             NativeAntiCheat::getInstance().getSelf().getLogger().warn(
-                "Invalid ListCommandPageSize value, using default."
+                "Invalid ListCommandPageSize value in config, using default."
             );
+            ListCommandPageSize = 10; // Reset to default
         }
     } else {
-        NativeAntiCheat::getInstance().getSelf().getLogger().warn("ListCommandPageSize not found, using default.");
+        NativeAntiCheat::getInstance().getSelf().getLogger().warn(
+            "ListCommandPageSize field missing from config, using default."
+        );
+        ListCommandPageSize = 10; // Use default
     }
+
+    // Clear the in-memory list here as well, in case of config reloads after enable().
+    // Loading from DB should happen in enable().
     std::lock_guard<std::mutex> lock(muteListMutex);
-    MuteList.clear(); // 加载前清除现有数据
-    const auto& muteListData = j["MuteList"];
-    auto        now          = std::chrono::system_clock::now();
-    const char* fmt          = "%Y-%m-%d %H:%M:%S"; // 定义格式化字符串
+    MuteList.clear();
+}
+// --- Static LevelDB DAO Function Implementations ---
 
-    for (auto it = muteListData.begin(); it != muteListData.end(); ++it) {
-        const std::string& name         = it.key();
-        const auto&        muteInfoJson = it.value();
-
-        // 检查是否为新的字符串格式以及是否包含必要的字段
-        // Check if it's the new format (without duration_seconds)
-        if (muteInfoJson.is_object() && muteInfoJson.contains("expiration_time_str") && muteInfoJson.contains("reason")
-            && !muteInfoJson.contains("duration_seconds")) {
-            std::string expirationStr = muteInfoJson["expiration_time_str"].get<std::string>();
-            // int         durationSecs  = muteInfoJson["duration_seconds"].get<int>(); // Removed
-            std::string reason = muteInfoJson["reason"].get<std::string>();
-
-            std::tm            expiration_tm = {};
-            std::istringstream iss(expirationStr);
-            iss >> std::get_time(&expiration_tm, fmt); // 解析字符串
-
-            if (iss.fail()) {
-                // 记录时间格式无效的错误
-                // 可以在此处添加日志记录: logger.error("解析用户 {} 的过期时间字符串 '{}' 失败", name,
-                // expirationStr);
-                NativeAntiCheat::getInstance().getSelf().getLogger().error(
-                    "Failed to parse expiration time string for user {}: {}",
-                    name,
-                    expirationStr
-                );
-                continue;
-            }
-
-            // 将 tm 转换回 time_t，然后转换为 time_point
-            std::time_t expiration_tt = std::mktime(&expiration_tm);
-            if (expiration_tt == -1) {
-                // 记录时间转换无效的错误
-                // 可以在此处添加日志记录: logger.error("将用户 {} 解析后的时间转换为 time_t 失败", name);
-                NativeAntiCheat::getInstance().getSelf().getLogger().error(
-                    "Failed to convert parsed expiration time for user {} to time_t",
-                    name
-                );
-                continue;
-            }
-            auto expirationTime = std::chrono::system_clock::from_time_t(expiration_tt);
-
-            // 只加载尚未过期的禁言记录
-            if (expirationTime > now) {
-                MuteList[name] = {expirationTime, reason}; // Removed durationSecs
-            }
-        } else {
-            // 记录条目格式无效或缺少必要字段的错误
-            // Removed handling for old format with duration_seconds
-            NativeAntiCheat::getInstance().getSelf().getLogger().warn(
-                "Skipping invalid or incomplete mute entry for key '{}' (expected format without duration_seconds)",
-                name
-            );
-            continue;
-        }
+leveldb::Status MuteModule::AddMuteToDB(
+    const std::string&                           name,
+    const std::chrono::system_clock::time_point& expiration_time,
+    const std::string&                           reason
+) {
+    auto& dbService = LevelDBService::GetInstance();
+    if (!dbService.IsInitialized()) {
+        MuteModule::getInstance()->mLogger->error("LevelDBService not initialized for AddMuteToDB.");
+        return leveldb::Status::IOError("LevelDBService not initialized");
     }
+
+    std::string primaryKey = CreateMutePrimaryKey(name);
+    std::string expiryKey  = CreateMuteExpiryKey(name, expiration_time);
+
+    nlohmann::json valueJson;
+    valueJson["e"]       = MuteTimePointToMillis(expiration_time);
+    valueJson["r"]       = reason;
+    std::string valueStr = valueJson.dump();
+
+    leveldb::WriteBatch batch;
+    batch.Put(primaryKey, valueStr);
+    batch.Put(expiryKey, ""); // Empty value for expiry key
+
+    leveldb::WriteOptions writeOptions;
+    // writeOptions.sync = true; // Optional
+
+    leveldb::Status status = dbService.Write(writeOptions, &batch);
+    if (!status.ok()) {
+        MuteModule::getInstance()->mLogger->error("Failed to add Mute for '{}' to DB: {}", name, status.ToString());
+    } else {
+        MuteModule::getInstance()->mLogger->debug("Added Mute for '{}' to DB.", name);
+    }
+    return status;
 }
 
+std::optional<MuteModule::MuteInfo> MuteModule::GetMuteFromDB(const std::string& name) {
+    return GetMuteInfoFromDBInternal(name);
+}
+
+leveldb::Status MuteModule::RemoveMuteFromDB(const std::string& name) {
+    auto& dbService = LevelDBService::GetInstance();
+    if (!dbService.IsInitialized()) {
+        MuteModule::getInstance()->mLogger->error("LevelDBService not initialized for RemoveMuteFromDB.");
+        return leveldb::Status::IOError("LevelDBService not initialized");
+    }
+
+    // 1. Get mute info to find the expiration time for the expiry key
+    std::optional<MuteInfo> muteInfoOpt = GetMuteInfoFromDBInternal(name);
+
+    if (!muteInfoOpt.has_value()) {
+        // Check if it really doesn't exist or if Get failed previously
+        std::string     primaryKeyCheck = CreateMutePrimaryKey(name);
+        std::string     valueStrCheck;
+        leveldb::Status getStatus = dbService.Get(primaryKeyCheck, &valueStrCheck);
+        if (getStatus.IsNotFound()) {
+            MuteModule::getInstance()->mLogger->debug("Mute for '{}' not found in DB, removal skipped.", name);
+            return leveldb::Status::OK(); // Already gone is success
+        }
+        MuteModule::getInstance()->mLogger->warn(
+            "Mute info for '{}' disappeared or Get failed before removal from DB. Status: {}",
+            name,
+            getStatus.ToString()
+        );
+        return getStatus.ok() ? leveldb::Status::NotFound("Mute info disappeared before removal from DB") : getStatus;
+    }
+
+    // 2. Construct keys
+    std::string primaryKey = CreateMutePrimaryKey(name);
+    std::string expiryKey  = CreateMuteExpiryKey(name, muteInfoOpt.value().expiration_time);
+
+    // 3. Prepare batch delete
+    leveldb::WriteBatch batch;
+    batch.Delete(primaryKey);
+    batch.Delete(expiryKey);
+
+    leveldb::WriteOptions writeOptions;
+    // writeOptions.sync = true;
+
+    leveldb::Status status = dbService.Write(writeOptions, &batch);
+    if (!status.ok()) {
+        MuteModule::getInstance()
+            ->mLogger->error("Failed to remove Mute for '{}' from DB: {}", name, status.ToString());
+    } else {
+        MuteModule::getInstance()->mLogger->debug("Removed Mute for '{}' from DB.", name);
+    }
+    return status;
+}
+
+// --- End of Static LevelDB DAO Function Implementations ---
 } // namespace native_ac
 REGISTER_MODULE(native_ac::MuteModule, native_ac::MuteModule::getInstance());

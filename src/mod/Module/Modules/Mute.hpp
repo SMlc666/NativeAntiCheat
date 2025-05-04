@@ -9,6 +9,8 @@
 #include <mutex>
 #include <nlohmann/json_fwd.hpp> // Forward declaration for json
 #include <string>
+#include <optional>           // For optional return values
+#include <leveldb/status.h>   // For LevelDB status
 
 namespace native_ac {
 
@@ -39,5 +41,22 @@ public:
 protected:
     void from_json(const nlohmann::json& j) override;
     void to_json(nlohmann::json& j) const override;
+
+public: // Public static DAO functions
+    // --- Static LevelDB DAO Functions ---
+    // These functions interact directly with the LevelDB database.
+    // They do NOT modify the in-memory mute list (MuteList).
+
+    // Add Mute to LevelDB
+    static leveldb::Status AddMuteToDB(const std::string& name, const std::chrono::system_clock::time_point& expiration_time, const std::string& reason);
+
+    // Get Mute from LevelDB
+    static std::optional<MuteModule::MuteInfo> GetMuteFromDB(const std::string& name);
+
+    // Remove Mute from LevelDB
+    static leveldb::Status RemoveMuteFromDB(const std::string& name);
+
+    // Optional: Load all mutes from DB (not implemented per requirements)
+    // static std::vector<MuteInfo> LoadAllMutesFromDB();
 };
 } // namespace native_ac

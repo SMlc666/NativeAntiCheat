@@ -1,3 +1,4 @@
+#pragma once
 #include "ll/api/base/Macro.h"
 #include "ll/api/event/Cancellable.h"
 #include "mc/network/NetworkIdentifier.h"

@@ -15,6 +15,8 @@ add_requires("levibuildscript")
 add_requires("parallel-hashmap")
 add_requires("nlohmann_json 3.11.3")
 add_requires("spdlog 1.15.2")
+add_requires("leveldb ")
+
 if not has_config("vs_runtime") then
     set_runtimes("MD")
 end
@@ -34,6 +36,7 @@ target("NativeAntiCheat") -- Change this to your mod name.
     add_packages("parallel-hashmap")
     add_packages("nlohmann_json")
     add_packages("spdlog")
+    add_packages("leveldb")
     set_exceptions("none") -- To avoid conflicts with /EHa.
     set_kind("shared")
     set_languages("c++20")

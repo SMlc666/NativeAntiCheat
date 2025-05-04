@@ -1,11 +1,13 @@
 #include "mod/NativeAntiCheat.h"
 
 #include "Module/ConfigHelper.hpp"
+#include "Module/LevelDBService.hpp" // 添加 LevelDBService 头文件
 #include "ll/api/io/LogLevel.h"
 #include "ll/api/mod/RegisterHelper.h"
 #include "mod/BenchMark/BenchMark.hpp"
 #include "mod/Module/ModuleManager.hpp"
 #include <optional>
+#include <filesystem> // 确保包含 filesystem
 
 namespace native_ac {
 NativeAntiCheat& NativeAntiCheat::getInstance() {
@@ -15,6 +17,17 @@ NativeAntiCheat& NativeAntiCheat::getInstance() {
 
 bool NativeAntiCheat::load() {
     mConfigPath = getSelf().getConfigDir().string() + "/config.json";
+
+    // 初始化 LevelDBService
+    std::string dbPath = (getSelf().getDataDir() / "leveldb").string();
+    leveldb::Status dbStatus = LevelDBService::GetInstance().Init(dbPath);
+    if (!dbStatus.ok()) {
+        getSelf().getLogger().error("Failed to initialize LevelDB at {}: {}", dbPath, dbStatus.ToString());
+        return false; // 初始化失败，加载失败
+    }
+    getSelf().getLogger().info("LevelDB initialized successfully at: {}", dbPath);
+
+
 #ifdef DEBUG
     getSelf().getLogger().setLevel(ll::io::LogLevel::Debug);
     getSelf().getLogger().debug("Loading NativeAntiCheat...");
@@ -125,6 +138,11 @@ bool NativeAntiCheat::disable() {
         return false;
     }
     // Code for disabling the mod goes here.
+
+    // 关闭 LevelDBService
+    LevelDBService::GetInstance().Shutdown();
+    getSelf().getLogger().info("LevelDB shutdown.");
+
     return true;
 }
 
